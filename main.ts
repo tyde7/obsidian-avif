@@ -1,32 +1,32 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Editor, MarkdownView, Modal, FileSystemAdapter, Plugin, PluginSettingTab, Setting, moment } from 'obsidian';
+import { clipboard } from "electron";
+import { extname, resolve, join } from 'path';
 
 // Remember to rename these classes and interfaces!
 
-interface MyPluginSettings {
-	mySetting: string;
+interface ObsidianAvifPluginSettings {
+	avifPath: string;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+const DEFAULT_SETTINGS: ObsidianAvifPluginSettings = {
+	avifPath: '/Users/$USER/go/bin/avif'
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+const exec = require('child_process').exec;
+
+function execute(command, callback) {
+	exec(command, (error, stdout, stderr) => {
+		console.log(error, stdout, stderr)
+		callback(error, stdout, stderr);
+	});
+};
+
+
+export default class ObsidianAvifPlugin extends Plugin {
+	settings: ObsidianAvifPluginSettings;
 
 	async onload() {
 		await this.loadSettings();
-
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
 
 		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
@@ -68,6 +68,8 @@ export default class MyPlugin extends Plugin {
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new SampleSettingTab(this.app, this));
 
+		this.setupPasteHandler()
+
 		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
 		// Using this function will automatically remove the event listener when this plugin is disabled.
 		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
@@ -81,6 +83,157 @@ export default class MyPlugin extends Plugin {
 	onunload() {
 
 	}
+
+	setupPasteHandler() {
+		this.app.workspace.on(
+			"editor-paste",
+			(evt: ClipboardEvent, editor: Editor, markdownView: MarkdownView) => {
+				const os = this.getOS();
+				if (os !== "MacOS") {
+					console.log("not macos, pic won't be processed")
+					return
+				}
+				let files = evt.clipboardData.files;
+				if (
+					this.isCopyImageFile() ||
+					files.length !== 0 ||
+					files[0].type.startsWith("image")
+				) {
+					console.log("pasting image")
+					const avif: string = this.getAvifPasteFile(editor)
+					evt.preventDefault();
+				} else {
+					console.log("cannot paste")
+				}
+			}
+		);
+	}
+
+	getAvifPasteFile(editor: Editor): string {
+		const timebase = moment(new Date()).format("-YYYYMMDD-")
+		const baseFile = (
+			this.app.vault.adapter as FileSystemAdapter
+		).getName();
+		const randomPrefix: string = baseFile + timebase + (Math.random() + 1).toString(36).substr(2, 7)
+		const pngPath: string = randomPrefix + ".png"
+		const avifPath = randomPrefix + ".avif"
+		const fullAvifPath = this.getFileAssetPath() + "/" + avifPath
+		console.debug("pngpath:", pngPath)
+		console.debug("avifpath:", avifPath)
+		console.debug("full avifpath:", fullAvifPath)
+		console.debug("full avif exec path:", this.settings.avifPath)
+		execute("/usr/local/bin/pngpaste /tmp/" + pngPath, () => {
+			execute(this.settings.avifPath + " --fast -e /tmp/" + pngPath + " -o \"" + fullAvifPath + "\"", () => {
+				this.insertTemporaryText(editor, fullAvifPath)
+			})
+		})
+		return fullAvifPath
+	}
+
+	isCopyImageFile() {
+		let filePath = "";
+		const os = this.getOS();
+
+		if (os === "Windows") {
+			var rawFilePath = clipboard.read("FileNameW");
+			filePath = rawFilePath.replace(
+				new RegExp(String.fromCharCode(0), "g"),
+				""
+			);
+		} else if (os === "MacOS") {
+			filePath = clipboard.read("public.file-url").replace("file://", "");
+		} else {
+			filePath = "";
+		}
+		return this.isAssetTypeAnImage(filePath);
+	}
+	isAssetTypeAnImage(path: string): Boolean {
+		return (
+			[".png", ".jpg", ".jpeg", ".bmp", ".gif", ".svg", ".tiff"].indexOf(
+				extname(path).toLowerCase()
+			) !== -1
+		);
+	}
+	getOS() {
+		const { appVersion } = navigator;
+		if (appVersion.indexOf("Win") !== -1) {
+			return "Windows";
+		} else if (appVersion.indexOf("Mac") !== -1) {
+			return "MacOS";
+		} else if (appVersion.indexOf("X11") !== -1) {
+			return "Linux";
+		} else {
+			return "Unknown OS";
+		}
+	}
+	insertTemporaryText(editor: Editor, progressText: string) {
+		editor.replaceSelection(`![](${ObsidianAvifPlugin.getFileName(progressText)})` + "\n");
+	}
+
+	static getFileName(fn: string): string {
+		return "file:///" + encodeURI(fn)
+	}
+	embedMarkDownImage(editor: Editor, pasteId: string, imageUrl: string) {
+		let progressText = ObsidianAvifPlugin.progressTextFor(pasteId);
+		let markDownImage = `![](${imageUrl})`;
+
+		ObsidianAvifPlugin.replaceFirstOccurrence(
+			editor,
+			progressText,
+			markDownImage
+		);
+	}
+
+	handleFailedUpload(editor: Editor, pasteId: string, reason: any) {
+		console.error("Failed request: ", reason);
+		let progressText = ObsidianAvifPlugin.progressTextFor(pasteId);
+		ObsidianAvifPlugin.replaceFirstOccurrence(
+			editor,
+			progressText,
+			"⚠️upload failed, check dev console"
+		);
+	}
+	private static progressTextFor(id: string) {
+		return `![Uploading file...${id}]()`;
+	}
+
+	static replaceFirstOccurrence(
+		editor: Editor,
+		target: string,
+		replacement: string
+	) {
+		let lines = editor.getValue().split("\n");
+		for (let i = 0; i < lines.length; i++) {
+			let ch = lines[i].indexOf(target);
+			if (ch != -1) {
+				let from = { line: i, ch: ch };
+				let to = { line: i, ch: ch + target.length };
+				editor.replaceRange(replacement, from, to);
+				break;
+			}
+		}
+	}
+	getFileAssetPath() {
+		const basePath = (
+			this.app.vault.adapter as FileSystemAdapter
+		).getBasePath();
+
+		// @ts-ignore
+		const assetFolder: string = this.app.vault.config.attachmentFolderPath;
+		const activeFile = this.app.vault.getAbstractFileByPath(
+			this.app.workspace.getActiveFile().path
+		);
+
+		// 当前文件夹下的子文件夹
+		if (assetFolder.startsWith("./")) {
+			const activeFolder = decodeURI(resolve(basePath, activeFile.parent.path));
+			return join(activeFolder, assetFolder);
+		} else {
+			// 根文件夹
+			return join(basePath, assetFolder);
+		}
+	}
+
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -97,30 +250,30 @@ class SampleModal extends Modal {
 	}
 
 	onOpen() {
-		const {contentEl} = this;
+		const { contentEl } = this;
 		contentEl.setText('Woah!');
 	}
 
 	onClose() {
-		const {contentEl} = this;
+		const { contentEl } = this;
 		contentEl.empty();
 	}
 }
 
 class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+	plugin: ObsidianAvifPlugin;
 
-	constructor(app: App, plugin: MyPlugin) {
+	constructor(app: App, plugin: ObsidianAvifPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
 
 	display(): void {
-		const {containerEl} = this;
+		const { containerEl } = this;
 
 		containerEl.empty();
 
-		containerEl.createEl('h2', {text: 'Settings for my awesome plugin.'});
+		containerEl.createEl('h2', { text: 'Settings for my awesome plugin.' });
 
 		new Setting(containerEl)
 			.setName('Setting #1')
